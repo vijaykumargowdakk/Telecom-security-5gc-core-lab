@@ -10,11 +10,9 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-REAL_USER="${SUDO_USER:-$USER}"
-USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# 1. Detect or prompt for network interface
+# 1. Interface Detection
 AVAILABLE_INTERFACES=($(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo\|dummy\|upf\|sbi\|docker\|tun"))
 
 if [ -n "$1" ]; then
@@ -33,14 +31,14 @@ fi
 
 SERVER_IP=$(ip -4 addr show dev "$PHYSICAL_IF" | grep -m1 inet | awk '{print $2}' | cut -d'/' -f1)
 if [ -z "$SERVER_IP" ]; then
-    echo "[-] Error: No IPv4 address assigned to $PHYSICAL_IF. Ensure the network cable/Wi-Fi is connected."
+    echo "[-] Error: No IPv4 address found on $PHYSICAL_IF."
     exit 1
 fi
 
 echo "[+] Using Interface: $PHYSICAL_IF"
 echo "[+] Detected Core IP: $SERVER_IP"
 
-# 2. Host Kernel and Routing Policies
+# 2. Kernel Routing & Forwarding
 echo "[+] Configuring Kernel IP forwarding and routing..."
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
@@ -50,7 +48,7 @@ sysctl -w net.ipv4.conf.lo.rp_filter=0 >/dev/null
 sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null
 systemctl stop ufw >/dev/null 2>&1 || true
 
-# 3. Dummy SBI Network (10.0.0.0/24) for Service-Based Architecture
+# 3. Dummy Interface for SBI (10.0.0.1/24)
 echo "[+] Configuring sbi_net dummy interface (10.0.0.1/24)..."
 ip link add dev sbi_net type dummy 2>/dev/null || true
 ip addr add 10.0.0.1/24 dev sbi_net 2>/dev/null || true
@@ -63,7 +61,7 @@ iptables -A FORWARD -j ACCEPT
 iptables -t nat -C POSTROUTING -o "$PHYSICAL_IF" -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -o "$PHYSICAL_IF" -j MASQUERADE
 
-# 5. Kernel Modules and MongoDB
+# 5. Modules & Database
 echo "[+] Checking gtp5g module..."
 if ! lsmod | grep -q "gtp5g"; then
     modprobe udp_tunnel 2>/dev/null || true
@@ -78,55 +76,72 @@ echo "[+] Starting MongoDB service..."
 systemctl start mongod
 mongosh free5gc --eval "db.NfProfile.deleteMany({})" 2>/dev/null || mongo free5gc --eval "db.NfProfile.deleteMany({})" 2>/dev/null || true
 
-# 6. Dynamically patch configuration files with SERVER_IP
+# 6. Safe Configuration Updates via Python
 echo "[+] Updating core configuration files with IP: $SERVER_IP..."
-CONFIG_DIR="$SCRIPT_DIR/config"
-if [ ! -d "$CONFIG_DIR" ]; then
-    echo "[-] Error: config directory not found at $CONFIG_DIR"
-    exit 1
-fi
+python3 - << PYEOF
+import re
 
-# Patch AMF NGAP listener to listen on the dynamic host IP
-if [ -f "$CONFIG_DIR/amfcfg.yaml" ]; then
-    sed -i -E "s/ngapIpList:.*/ngapIpList: [\"$SERVER_IP\"]/g" "$CONFIG_DIR/amfcfg.yaml"
-fi
+# Update amfcfg.yaml ngapIpList
+with open("$SCRIPT_DIR/config/amfcfg.yaml", "r") as f:
+    lines = f.readlines()
 
-# Patch UPF GTP-U (N3) address to the dynamic host IP
-if [ -f "$CONFIG_DIR/upfcfg.yaml" ]; then
-    sed -i -E "/type: N3/,/addr:/ s/addr: [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/addr: $SERVER_IP/" "$CONFIG_DIR/upfcfg.yaml"
-fi
+out = []
+in_ngap = False
+for line in lines:
+    if "ngapIpList:" in line:
+        out.append("  ngapIpList:\n")
+        out.append("    - $SERVER_IP\n")
+        in_ngap = True
+    elif in_ngap and line.strip().startswith("-"):
+        continue  # Skip old list items
+    else:
+        in_ngap = False
+        out.append(line)
 
-# Ensure SMF PFCP listenAddr/nodeID is 10.0.0.2 and target UPF is 10.0.0.1
-if [ -f "$CONFIG_DIR/smfcfg.yaml" ]; then
-    sed -i '/pfcp:/,/assocFailAlertInterval:/ s/nodeID: .*/nodeID: 10.0.0.2/' "$CONFIG_DIR/smfcfg.yaml"
-    sed -i '/pfcp:/,/assocFailAlertInterval:/ s/listenAddr: .*/listenAddr: 10.0.0.2/' "$CONFIG_DIR/smfcfg.yaml"
-    sed -i '/pfcp:/,/assocFailAlertInterval:/ s/externalAddr: .*/externalAddr: 10.0.0.2/' "$CONFIG_DIR/smfcfg.yaml"
-    sed -i '/UPF:/,/interfaces:/ s/nodeID: .*/nodeID: 10.0.0.1/' "$CONFIG_DIR/smfcfg.yaml"
-    sed -i '/UPF:/,/interfaces:/ s/addr: .*/addr: 10.0.0.1/' "$CONFIG_DIR/smfcfg.yaml"
-fi
+with open("$SCRIPT_DIR/config/amfcfg.yaml", "w") as f:
+    f.writelines(out)
 
-# 7. Terminate any previous instances
-echo "[+] Cleaning up any lingering instances..."
+# Update upfcfg.yaml N3 GTP-U IP
+with open("$SCRIPT_DIR/config/upfcfg.yaml", "r") as f:
+    upf = f.read()
+upf = re.sub(r'(- type: N3\s+addr:\s*)[0-9\.]+', r'\g<1>$SERVER_IP', upf)
+with open("$SCRIPT_DIR/config/upfcfg.yaml", "w") as f:
+    f.write(upf)
+
+# Ensure smfcfg.yaml PFCP bindings stay aligned
+with open("$SCRIPT_DIR/config/smfcfg.yaml", "r") as f:
+    smf = f.read()
+smf = re.sub(r'nodeID: 10\.0\.0\.[0-9]+(\s*# the Node ID of this SMF)', r'nodeID: 10.0.0.2\1', smf)
+smf = re.sub(r'listenAddr: 10\.0\.0\.[0-9]+(\s*# the IP/FQDN of N4 interface on this SMF)', r'listenAddr: 10.0.0.2\1', smf)
+smf = re.sub(r'externalAddr: 10\.0\.0\.[0-9]+(\s*# the IP/FQDN of N4 interface on this SMF)', r'externalAddr: 10.0.0.2\1', smf)
+smf = re.sub(r'(UPF:.*?\n\s+type: UPF.*?\n\s+nodeID:\s*)10\.0\.0\.[0-9]+', r'\g<1>10.0.0.1', smf, flags=re.DOTALL)
+smf = re.sub(r'(UPF:.*?\n\s+type: UPF.*?\n\s+nodeID:.*?\n\s+addr:\s*)10\.0\.0\.[0-9]+', r'\g<1>10.0.0.1', smf, flags=re.DOTALL)
+with open("$SCRIPT_DIR/config/smfcfg.yaml", "w") as f:
+    f.write(smf)
+PYEOF
+
+# 7. Cleanup & Startup
+echo "[+] Cleaning up previous instances..."
 killall -q -9 amf smf nrf udr udm pcf ausf nssf chf nef bsf upf webconsole 2>/dev/null || true
 pkill -9 -f "free5gc/bin" 2>/dev/null || true
 ip link delete upfgtp 2>/dev/null || true
 sleep 2
 
-# 8. Start free5GC
 echo "[+] Starting free5GC Core Network..."
 cd "$SCRIPT_DIR"
 nohup ./run.sh > free5gc_startup.log 2>&1 &
 FREE5GC_PID=$!
 echo "[+] free5GC started (PID: $FREE5GC_PID). Log: free5gc_startup.log"
 
-# Wait for AMF to listen on port 38412
+# Wait for AMF to bind
 echo "[*] Waiting for AMF to bind to $SERVER_IP:38412..."
 COUNT=0
 while ! ss -l -n -a --sctp | grep -q "$SERVER_IP:38412"; do
     sleep 1
     COUNT=$((COUNT + 1))
-    if [ "$COUNT" -ge 25 ]; then
-        echo "[-] Timeout: AMF did not bind to $SERVER_IP:38412. Check free5gc_startup.log."
+    if [ "$COUNT" -ge 20 ]; then
+        echo "[-] Timeout: AMF did not bind to $SERVER_IP:38412. Error details from log:"
+        grep -aiE "amf|fatal|panic|error" free5gc_startup.log | tail -n 15
         exit 1
     fi
 done
