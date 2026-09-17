@@ -1,0 +1,8 @@
+*.log
+free5gc_startup.log
+webconsole.log
+*.pcap
+bin/
+webconsole/bin/
+*.o
+*.ko
